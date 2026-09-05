@@ -1,0 +1,6 @@
+{
+  "name": "Cloud Run AI Security & Threat Workbench",
+  "description": "User-authenticated journal and AI reflection platform with Cloud Firestore user data isolation and resilient Gemini 3.6 Flash processing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,30 +1,76 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
+import { adminApp, adminAuth, adminDb, projectId, databaseId } from './lib/firebase-admin';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Directive 6: Server-Side Robustness & Payload Ingestion Standards
 // Top-Level Request Deserialization (Ordering Guarantee): Mount body parsers before routes
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// Secret Manager Client & API Key Management
+let secretManagerClient: SecretManagerServiceClient | null = null;
+function getSecretManagerClient(): SecretManagerServiceClient {
+  if (!secretManagerClient) {
+    secretManagerClient = new SecretManagerServiceClient();
+  }
+  return secretManagerClient;
+}
+let cachedGeminiApiKey: string | null = null;
+
+export async function getGeminiApiKey(): Promise<string> {
+  if (cachedGeminiApiKey) {
+    return cachedGeminiApiKey;
+  }
+
+  const gcpProject =
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GCLOUD_PROJECT ||
+    projectId ||
+    'gen-lang-client-0211563645';
+
+  // Attempt 1: Fetch secret from Google Cloud Secret Manager
+  try {
+    const smClient = getSecretManagerClient();
+    const secretVersionName = `projects/${gcpProject}/secrets/GEMINI_API_KEY/versions/latest`;
+    const [version] = await smClient.accessSecretVersion({
+      name: secretVersionName,
+    });
+    const secretData = version.payload?.data?.toString();
+    if (secretData && secretData.trim()) {
+      cachedGeminiApiKey = secretData.trim();
+      console.log('[Secret Manager] Successfully loaded GEMINI_API_KEY from Secret Manager.');
+      return cachedGeminiApiKey;
+    }
+  } catch (smError: any) {
+    console.warn(
+      '[Secret Manager] Could not retrieve GEMINI_API_KEY from Secret Manager (falling back to env variable):',
+      smError?.message
+    );
+  }
+
+  // Attempt 2: Fall back to environment variable
+  const envKey = process.env.GEMINI_API_KEY;
+  if (envKey && envKey.trim()) {
+    cachedGeminiApiKey = envKey.trim();
+    return cachedGeminiApiKey;
+  }
+
+  throw new Error('GEMINI_API_KEY could not be loaded from Secret Manager or environment variables.');
+}
+
 // Lazy GoogleGenAI client initialization
 let genAiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI {
+async function getGeminiClient(): Promise<GoogleGenAI> {
   if (!genAiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is missing.');
-    }
+    const apiKey = await getGeminiApiKey();
     genAiClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
@@ -59,7 +105,7 @@ async function generateContentWithFallback(
   contents: string | Array<{ role: string; parts: Array<{ text: string }> }>,
   systemInstruction?: string
 ): Promise<GenerateFallbackResult> {
-  const client = getGeminiClient();
+  const client = await getGeminiClient();
   const attemptedModels: string[] = [];
   let lastError: any = null;
 
@@ -118,14 +164,84 @@ async function generateContentWithFallback(
   throw new Error(`All models in fallback ladder exhausted. Last error: ${String((lastError as any)?.message || lastError)}`);
 }
 
+// Directive 6: Strict Undefined-Stripping (Zero-Crash Payload Hygiene)
+function sanitizePayload<T>(obj: T): T {
+  return JSON.parse(
+    JSON.stringify(obj, (_, value) => (value === undefined ? null : value))
+  );
+}
+
+// Authenticated Request Interface
+export interface AuthenticatedRequest extends Request {
+  user?: {
+    uid: string;
+    email?: string;
+    [key: string]: any;
+  };
+}
+
+/**
+ * Firebase ID Token Verification Middleware
+ * Validates the cryptographically signed JWT token from the client's Authorization header
+ */
+async function verifyFirebaseToken(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({
+      success: false,
+      error: 'Unauthorized: Missing or invalid Authorization header. Expected Bearer <Firebase_ID_Token>.',
+    });
+    return;
+  }
+
+  const idToken = authHeader.split('Bearer ')[1].trim();
+  if (!idToken) {
+    res.status(401).json({
+      success: false,
+      error: 'Unauthorized: Empty bearer token provided.',
+    });
+    return;
+  }
+
+  try {
+    const decodedToken = await adminAuth.verifyIdToken(idToken);
+    req.user = decodedToken;
+    next();
+  } catch (error: any) {
+    console.error('[Auth Middleware] Firebase ID Token verification failed:', error?.message);
+    res.status(401).json({
+      success: false,
+      error: 'Unauthorized: Invalid or expired Firebase ID token.',
+      details: error?.message,
+    });
+  }
+}
+
 // Health check endpoint
-app.get('/api/health', (_req: Request, res: Response) => {
+app.get('/api/health', async (_req: Request, res: Response) => {
+  let hasKey = Boolean(cachedGeminiApiKey || process.env.GEMINI_API_KEY);
+  if (!hasKey) {
+    try {
+      const key = await getGeminiApiKey();
+      hasKey = Boolean(key);
+    } catch {
+      hasKey = false;
+    }
+  }
+
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     primaryModel: MODEL_FALLBACK_LADDER[0],
     fallbackLadder: MODEL_FALLBACK_LADDER,
-    hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    hasApiKey: hasKey,
+    firebaseAdminInitialized: Boolean(adminApp),
+    firestoreDatabaseId: databaseId,
+    projectId,
   });
 });
 
@@ -216,6 +332,169 @@ Security & Persona Rules:
   }
 });
 
+// ==========================================
+// Firebase Admin Firestore Routes (Backend API)
+// ==========================================
+
+/**
+ * Route: POST /api/interactions/save
+ * Persists an interaction directly via Firebase Admin SDK
+ * Strictly bound to the verified authenticated user's collection
+ */
+app.post('/api/interactions/save', verifyFirebaseToken, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.uid;
+    if (!userId) {
+      res.status(401).json({ success: false, error: 'Unauthorized: User ID missing from token.' });
+      return;
+    }
+
+    const data = (req.body && typeof req.body === 'object') ? req.body : {};
+    const {
+      prompt,
+      geminiResponse,
+      mode = 'reflect',
+      modelUsed = 'gemini-3.6-flash',
+      durationMs,
+      createdAt,
+      title,
+      userEmail,
+      id,
+    } = data;
+
+    if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+      res.status(400).json({ success: false, error: 'Field "prompt" is required and cannot be empty.' });
+      return;
+    }
+
+    const interactionId = id || `int_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    // Directive 6: Undefined-Stripping Zero-Crash Payload Hygiene
+    const cleanPayload = sanitizePayload({
+      userId,
+      userEmail: userEmail || req.user?.email || null,
+      prompt: prompt.trim(),
+      geminiResponse: geminiResponse || '',
+      mode,
+      modelUsed,
+      durationMs: typeof durationMs === 'number' ? durationMs : null,
+      createdAt: createdAt || Date.now(),
+      title: title || (prompt.trim().slice(0, 45) + (prompt.trim().length > 45 ? '...' : '')),
+    });
+
+    // Save to Firestore via Firebase Admin SDK targeting the isolated subcollection
+    const docRef = adminDb.collection('users').doc(userId).collection('interactions').doc(interactionId);
+    await docRef.set(cleanPayload, { merge: true });
+
+    res.json({
+      success: true,
+      id: interactionId,
+      record: {
+        id: interactionId,
+        ...cleanPayload,
+      },
+    });
+  } catch (error: any) {
+    console.error('[API /api/interactions/save Error]:', error);
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'Failed to persist interaction to Firestore via Admin SDK.',
+    });
+  }
+});
+
+/**
+ * Route: GET /api/interactions/fetch & POST /api/interactions/fetch
+ * Retrieves the authenticated user's isolated interactions
+ */
+const handleFetchInteractions = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.uid;
+    if (!userId) {
+      res.status(401).json({ success: false, error: 'Unauthorized: User ID missing from token.' });
+      return;
+    }
+
+    const queryLimit = parseInt(req.query.limit as string) || parseInt(req.body?.limit as string) || 50;
+    const maxItems = Math.max(1, Math.min(queryLimit, 100));
+
+    const snapshot = await adminDb
+      .collection('users')
+      .doc(userId)
+      .collection('interactions')
+      .orderBy('createdAt', 'desc')
+      .limit(maxItems)
+      .get();
+
+    const interactions = snapshot.docs.map((docSnapshot) => {
+      const d = docSnapshot.data();
+      return {
+        id: docSnapshot.id,
+        userId: d.userId,
+        userEmail: d.userEmail,
+        prompt: d.prompt || '',
+        geminiResponse: d.geminiResponse || '',
+        mode: d.mode || 'reflect',
+        modelUsed: d.modelUsed || 'gemini-3.6-flash',
+        durationMs: d.durationMs,
+        createdAt: d.createdAt || 0,
+        title: d.title || '',
+      };
+    });
+
+    res.json({
+      success: true,
+      interactions,
+    });
+  } catch (error: any) {
+    console.error('[API /api/interactions/fetch Error]:', error);
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'Failed to fetch interactions from Firestore via Admin SDK.',
+    });
+  }
+};
+
+app.get('/api/interactions/fetch', verifyFirebaseToken, handleFetchInteractions);
+app.post('/api/interactions/fetch', verifyFirebaseToken, handleFetchInteractions);
+
+/**
+ * Route: POST /api/interactions/delete & DELETE /api/interactions/delete
+ * Deletes an interaction document isolated to the authenticated user
+ */
+const handleDeleteInteraction = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.uid;
+    if (!userId) {
+      res.status(401).json({ success: false, error: 'Unauthorized: User ID missing from token.' });
+      return;
+    }
+
+    const interactionId = req.body?.id || req.body?.interactionId || (req.query?.id as string);
+    if (!interactionId || typeof interactionId !== 'string') {
+      res.status(400).json({ success: false, error: 'Field "id" (interaction ID) is required for deletion.' });
+      return;
+    }
+
+    const docRef = adminDb.collection('users').doc(userId).collection('interactions').doc(interactionId);
+    await docRef.delete();
+
+    res.json({
+      success: true,
+      deletedId: interactionId,
+    });
+  } catch (error: any) {
+    console.error('[API /api/interactions/delete Error]:', error);
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'Failed to delete interaction from Firestore via Admin SDK.',
+    });
+  }
+};
+
+app.post('/api/interactions/delete', verifyFirebaseToken, handleDeleteInteraction);
+app.delete('/api/interactions/delete', verifyFirebaseToken, handleDeleteInteraction);
+
 // Vite & Static file serving
 async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
@@ -228,16 +507,17 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(__dirname, 'dist');
+    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Server] Cloud Run AI Security Workbench server running on http://0.0.0.0:${PORT} (Mode: ${process.env.NODE_ENV || 'development'})`);
-  });
+  console.log(`[Server] Cloud Run AI Security Workbench server running on http://0.0.0.0:${PORT} (Mode: ${process.env.NODE_ENV || 'development'})`);
+});
+
 }
 
 startServer().catch((err) => {

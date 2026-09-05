@@ -3,9 +3,6 @@ import {
   signInWithGoogle,
   signOutUser,
   subscribeToAuthState,
-  saveUserInteraction,
-  fetchUserInteractions,
-  deleteUserInteraction,
   InteractionRecord,
   User,
 } from './lib/firebase';
@@ -57,13 +54,41 @@ export default function App() {
   // Multi-turn active conversation context for current thread
   const [activeThread, setActiveThread] = useState<Array<{ role: 'user' | 'model'; content: string }>>([]);
 
+  const loadUserHistory = useCallback(async (userOrUserId?: User | string | null) => {
+    let activeUser: User | null = null;
+    if (userOrUserId && typeof userOrUserId === 'object' && 'getIdToken' in userOrUserId) {
+      activeUser = userOrUserId as User;
+    } else {
+      activeUser = currentUser;
+    }
+    if (!activeUser) return;
+    setHistoryLoading(true);
+    try {
+      const idToken = await activeUser.getIdToken();
+      const res = await fetch('/api/interactions/fetch?limit=50', {
+        headers: {
+          'Authorization': `Bearer ${idToken}`,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to load interactions from backend API.');
+      }
+      setHistory(data.interactions || []);
+    } catch (err: any) {
+      console.error('Failed to load past entries via backend API:', err);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [currentUser]);
+
   // Listen to Firebase Auth state
   useEffect(() => {
-    const unsubscribe = subscribeToAuthState(currentUser => {
-      setCurrentUser(currentUser);
+    const unsubscribe = subscribeToAuthState(user => {
+      setCurrentUser(user);
       setAuthLoading(false);
-      if (currentUser) {
-        loadUserHistory(currentUser.uid);
+      if (user) {
+        loadUserHistory(user);
       } else {
         setHistory([]);
         setSelectedEntry(null);
@@ -72,19 +97,7 @@ export default function App() {
       }
     });
     return () => unsubscribe();
-  }, []);
-
-  const loadUserHistory = useCallback(async (userId: string) => {
-    setHistoryLoading(true);
-    try {
-      const records = await fetchUserInteractions(userId);
-      setHistory(records);
-    } catch (err: any) {
-      console.error('Failed to load past entries:', err);
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
+  }, [loadUserHistory]);
 
   const handleSignIn = async () => {
     setAuthLoading(true);
@@ -107,7 +120,7 @@ export default function App() {
     }
   };
 
-  // Submit Reflection to Gemini & Commit to Firestore
+  // Submit Reflection to Gemini & Commit to Firestore via Backend API
   const handleSubmitReflection = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!prompt.trim() || !currentUser || isGenerating) return;
@@ -118,11 +131,14 @@ export default function App() {
     setSaveStatus('idle');
 
     try {
+      const idToken = await currentUser.getIdToken();
+
       // 1. Send request to Server-Side Resilient Gemini Gateway
       const res = await fetch('/api/gemini/reflect', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`,
         },
         body: JSON.stringify({
           prompt: userPrompt,
@@ -153,7 +169,7 @@ export default function App() {
       ];
       setActiveThread(updatedThread);
 
-      // 2. Guaranteed Transaction Verification: Save to Cloud Firestore
+      // 2. Guaranteed Transaction Verification: Save via Backend API (/api/interactions/save)
       setSaveStatus('saving');
       const payloadToSave = {
         userEmail: currentUser.email,
@@ -167,7 +183,21 @@ export default function App() {
       };
 
       try {
-        const docId = await saveUserInteraction(currentUser.uid, payloadToSave);
+        const saveRes = await fetch('/api/interactions/save', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`,
+          },
+          body: JSON.stringify(payloadToSave),
+        });
+
+        const saveData = await saveRes.json();
+        if (!saveRes.ok || !saveData.success) {
+          throw new Error(saveData.error || 'Failed to save interaction via backend.');
+        }
+
+        const docId = saveData.id;
         setSaveStatus('saved');
         setLastFailedPayload(null);
         // Add to history state
@@ -179,7 +209,7 @@ export default function App() {
         setHistory((prev) => [newRecord, ...prev]);
         setPrompt(''); // Only clear prompt buffer on confirmed save
       } catch (saveErr: any) {
-        console.error('Firestore save failed:', saveErr);
+        console.error('Backend API save failed:', saveErr);
         setSaveStatus('error');
         setLastFailedPayload(payloadToSave);
         // Preserve prompt so user does not lose input
@@ -196,7 +226,22 @@ export default function App() {
     if (!lastFailedPayload || !currentUser) return;
     setSaveStatus('saving');
     try {
-      const docId = await saveUserInteraction(currentUser.uid, lastFailedPayload);
+      const idToken = await currentUser.getIdToken();
+      const saveRes = await fetch('/api/interactions/save', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`,
+        },
+        body: JSON.stringify(lastFailedPayload),
+      });
+
+      const saveData = await saveRes.json();
+      if (!saveRes.ok || !saveData.success) {
+        throw new Error(saveData.error || 'Retry save failed on backend API.');
+      }
+
+      const docId = saveData.id;
       setSaveStatus('saved');
       const newRecord: InteractionRecord = {
         id: docId,
@@ -217,7 +262,21 @@ export default function App() {
     if (!window.confirm('Delete this entry permanently from Firestore?')) return;
 
     try {
-      await deleteUserInteraction(currentUser.uid, id);
+      const idToken = await currentUser.getIdToken();
+      const res = await fetch('/api/interactions/delete', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ id }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to delete interaction via backend API.');
+      }
+
       setHistory((prev) => prev.filter((item) => item.id !== id));
       if (selectedEntry?.id === id) {
         setSelectedEntry(null);

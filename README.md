@@ -8,11 +8,12 @@ ReflectAI is a production-grade full-stack web application designed for private 
 
 | Threat Zone | Identified Risks & Vectors | Implemented Production Countermeasures |
 | :--- | :--- | :--- |
-| **1. Input Surfaces** | Malformed payloads, excessive journal text length, prototype pollution. | Top-level body parser deserialization; defensive null-safe payload destructuring; 20,000 character limit enforcement. |
+| **1. Input Surfaces** | Malformed payloads, excessive journal text length, prototype pollution. | Top-level body parser deserialization; defensive null-safe payload destructuring; 20,000 character limit enforcement; JWT token authentication. |
 | **2. Planning & Reasoning** | Prompt injection (OWASP LLM01) attempting system instruction bypass. | Boundary separation treating user reflections strictly as passive data; strict refusal of instruction overrides. |
 | **3. Tool & API Execution** | Transient upstream API outages, quota exhaustion, SSRF. | Server-side Gemini proxy; 4-tier model fallback ladder (`gemini-3.6-flash` &rarr; `gemini-3.1-flash-lite` &rarr; `gemini-flash-latest` &rarr; `gemini-3.7-flash`). |
 | **4. Memory & State** | Cross-user data leakage, unauthenticated access, payload parsing errors. | Strict owner-bound path isolation (`/users/{userId}/interactions/{interactionId}`); zero-insecure Firestore rules; strict `undefined`-stripping payload hygiene. |
-| **5. Inter-System Communication** | API key leakage in browser client bundles. | Zero-hardcoding hygiene: `GEMINI_API_KEY` stored exclusively in Secret Manager / Server Environment Variables; federated Google Sign-In. |
+| **5. Inter-System Communication** | API key leakage in browser client bundles. | Zero-hardcoding hygiene: `GEMINI_API_KEY` stored exclusively in Secret Manager / Server Environment Variables; federated Google Sign-In with JWT verification. |
+| **6. Clinical & Ethical Boundaries** | User misinterpretation as licensed therapy; acute mental health crisis. | Prominent non-clinical boundary disclaimers across landing page, dashboard banner, and modal; server-side system instruction crisis triage protocol directing to 988 Lifeline and Crisis Text Line. |
 
 ---
 
@@ -134,8 +135,9 @@ Use the following step-by-step test matrix to verify end-to-end functionality:
 ### Test Case 2: Multi-Turn Journal Reflection & Fallback Resilience
 * **Trigger**: In the composer (`#composer-card`), select mode "Reflect", click quick prompt "Obstacle & Learning", and click "Send to Gemini" (`#btn-submit-reflection`).
 * **Expected Backend Action**:
-  1. Express receives `POST /api/gemini/reflect` with prompt and history.
-  2. `generateContentWithFallback` attempts primary model `gemini-3.6-flash`. If rate-limited or unavailable, it tries `gemini-3.1-flash-lite`.
+  1. Client sends `Authorization: Bearer <Firebase_ID_Token>` in header.
+  2. Express validates token via `verifyFirebaseToken` middleware (rejects with 401 if missing/invalid).
+  3. `generateContentWithFallback` attempts primary model `gemini-3.6-flash`. If rate-limited or unavailable, it tries `gemini-3.1-flash-lite`.
 * **Expected UI**:
   1. Loading spinner displays "Generating & Persisting...".
   2. Gemini response renders in the output card with model badge (`gemini-3.6-flash`) and latency.
@@ -157,3 +159,39 @@ Use the following step-by-step test matrix to verify end-to-end functionality:
 ### Test Case 5: Document Deletion Isolation
 * **Trigger**: Select an entry from history and click "Delete from Firestore".
 * **Expected Result**: Confirmation dialog appears; upon confirming, document is removed from `/users/{userId}/interactions/{interactionId}` and disappears from the UI.
+
+### Test Case 6: Mental Health Boundary Disclaimer & Crisis Resources Modal
+* **Trigger**: Click "Mental Health & Crisis Support" in the header (`#btn-safety-modal`), "Safety Boundaries & Lifelines" on landing (`#btn-landing-safety-modal`), "View Lifelines" on the dashboard banner (`#btn-banner-crisis-info`), or in the footer (`#btn-footer-safety-modal`).
+* **Expected UI**:
+  1. Full modal opens (`#safety-modal-overlay`).
+  2. Prominently displays: "ReflectAI is a self-reflection tool, NOT a substitute for professional mental health support."
+  3. Provides clickable, direct crisis resources:
+     - 988 Suicide & Crisis Lifeline (call/text 988, free, confidential, 24/7 in US & Canada).
+     - Crisis Text Line (Text HOME to 741741).
+     - The Trevor Project (1-866-488-7386).
+     - International directory links to findahelpline.com and befrienders.org.
+  4. Details intended benefits (Private non-judgmental space, AI reframing in Reflect/Brainstorm/Summarize/Chat modes, mental structuring) vs crucial limitations (algorithmic AI, no clinical qualifications, risk of misinterpretation, no crisis intervention).
+  5. Clicking "I Understand & Return to Journal" (`#btn-confirm-safety-understanding`) or close icon (`#btn-close-safety-modal`) smoothly dismisses the modal.
+
+### Test Case 7: System Prompt Crisis De-escalation & Triage Protocol
+* **Trigger**: Input distress or crisis-related reflections into `#journal-input` (e.g. self-harm ideation).
+* **Expected Backend Action**:
+  1. The enhanced `systemInstruction` in `server.ts` activates the Critical Mental Health Boundaries & Safety Protocols.
+  2. The model immediately prioritizes user safety, provides an empathetic, compassionate, and non-judgmental response, and delivers actionable human crisis resources (988 Lifeline, Crisis Text Line 741741, international contacts), urging connection with a trusted person or clinical professional.
+
+### Test Case 8: Mood Selection & Emotional Trend Tracking
+* **Trigger**: In the authenticated dashboard, write a journal reflection and select a mood emoji/label (e.g., `#mood-option-peaceful` 😌 Peaceful, or `#mood-option-anxious` 😰 Anxious) in `#mood-selector-container`.
+* **Expected Action**:
+  1. Selected mood is highlighted with active border and badge.
+  2. Clicking "Send to Gemini" submits prompt, mode, and mood metadata in the `/api/interactions/save` payload.
+  3. Server sanitizes mood payload and writes owner-isolated document to Firestore.
+* **Expected UI & Trend Tracking**:
+  1. The new reflection appears in `#history-panel` with its corresponding mood emoji and label badge (`#history-entry-mood-*`).
+  2. `#emotional-trends-tracker` immediately reflects the new entry:
+     - Average emotional tone score and descriptor update.
+     - Dominant mood counter increments.
+     - Trajectory sparkline adds a new interactive chronological node.
+     - Mood filter chips update with latest counts.
+  3. Clicking any mood filter chip (e.g., `#btn-filter-mood-peaceful`) dynamically filters the interaction history list to display only entries with that mood tag.
+  4. Clicking "Reset Mood Filter" or "Show all moods" restores the complete history view.
+

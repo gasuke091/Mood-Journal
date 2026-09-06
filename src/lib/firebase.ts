@@ -53,6 +53,72 @@ export function sanitizePayload<T>(obj: T): T {
   );
 }
 
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map((provider) => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || [],
+    },
+    operationType,
+    path,
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+export interface MoodData {
+  id: string;
+  label: string;
+  emoji: string;
+  color: string;
+  valence: number; // -2 (distressed) to +2 (peaceful/joyful)
+}
+
+export const AVAILABLE_MOODS: MoodData[] = [
+  { id: 'peaceful', label: 'Peaceful', emoji: '😌', color: 'emerald', valence: 2 },
+  { id: 'joyful', label: 'Joyful', emoji: '😊', color: 'amber', valence: 2 },
+  { id: 'grateful', label: 'Grateful', emoji: '🙏', color: 'teal', valence: 1 },
+  { id: 'inspired', label: 'Inspired', emoji: '💡', color: 'violet', valence: 1 },
+  { id: 'reflective', label: 'Reflective', emoji: '😐', color: 'stone', valence: 0 },
+  { id: 'anxious', label: 'Anxious', emoji: '😰', color: 'orange', valence: -1 },
+  { id: 'down', label: 'Down', emoji: '😔', color: 'sky', valence: -1 },
+  { id: 'overwhelmed', label: 'Overwhelmed', emoji: '😫', color: 'rose', valence: -2 },
+];
+
 export interface InteractionRecord {
   id?: string;
   userId: string;
@@ -64,6 +130,7 @@ export interface InteractionRecord {
   durationMs?: number;
   createdAt: number; // Unix timestamp
   title?: string;
+  mood?: MoodData | null;
 }
 
 /**
@@ -104,6 +171,7 @@ export async function saveUserInteraction(
   }
 
   const interactionId = `int_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  const path = `users/${userId}/interactions/${interactionId}`;
   const docRef = doc(db, 'users', userId, 'interactions', interactionId);
 
   const cleanData = sanitizePayload({
@@ -112,8 +180,12 @@ export async function saveUserInteraction(
     createdAt: data.createdAt || Date.now(),
   });
 
-  await setDoc(docRef, cleanData);
-  return interactionId;
+  try {
+    await setDoc(docRef, cleanData);
+    return interactionId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
 }
 
 /**
@@ -127,29 +199,35 @@ export async function fetchUserInteractions(
     throw new Error('User ID is required to fetch interactions.');
   }
 
+  const path = `users/${userId}/interactions`;
   const interactionsRef = collection(db, 'users', userId, 'interactions');
   const q = query(interactionsRef, orderBy('createdAt', 'desc'), limit(maxItems));
 
-  const querySnapshot = await getDocs(q);
-  const records: InteractionRecord[] = [];
+  try {
+    const querySnapshot = await getDocs(q);
+    const records: InteractionRecord[] = [];
 
-  querySnapshot.forEach((docSnapshot) => {
-    const docData = docSnapshot.data();
-    records.push({
-      id: docSnapshot.id,
-      userId: docData.userId,
-      userEmail: docData.userEmail,
-      prompt: docData.prompt || '',
-      geminiResponse: docData.geminiResponse || '',
-      mode: docData.mode || 'reflect',
-      modelUsed: docData.modelUsed || 'gemini-3.6-flash',
-      durationMs: docData.durationMs,
-      createdAt: docData.createdAt || 0,
-      title: docData.title || '',
+    querySnapshot.forEach((docSnapshot) => {
+      const docData = docSnapshot.data();
+      records.push({
+        id: docSnapshot.id,
+        userId: docData.userId,
+        userEmail: docData.userEmail,
+        prompt: docData.prompt || '',
+        geminiResponse: docData.geminiResponse || '',
+        mode: docData.mode || 'reflect',
+        modelUsed: docData.modelUsed || 'gemini-3.6-flash',
+        durationMs: docData.durationMs,
+        createdAt: docData.createdAt || 0,
+        title: docData.title || '',
+        mood: docData.mood || null,
+      });
     });
-  });
 
-  return records;
+    return records;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
 }
 
 /**
@@ -163,8 +241,13 @@ export async function deleteUserInteraction(
     throw new Error('User ID and Interaction ID are required for deletion.');
   }
 
+  const path = `users/${userId}/interactions/${interactionId}`;
   const docRef = doc(db, 'users', userId, 'interactions', interactionId);
-  await deleteDoc(docRef);
+  try {
+    await deleteDoc(docRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
 }
 
 export function subscribeToAuthState(callback: (user: User | null) => void) {

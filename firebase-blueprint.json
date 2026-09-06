@@ -1,0 +1,78 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Authenticated user profile in the application.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Unique identifier for the user from Firebase Auth."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Primary email address of the user."
+        }
+      },
+      "required": ["uid"]
+    },
+    "Interaction": {
+      "title": "Interaction",
+      "description": "A private journaling reflection and AI response with optional emotional mood tag.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "User UID who owns this interaction."
+        },
+        "userEmail": {
+          "type": "string",
+          "description": "Email address of the author."
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 20000,
+          "description": "User journal entry text."
+        },
+        "geminiResponse": {
+          "type": "string",
+          "description": "AI reflection, brainstorm, or summary output."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["reflect", "summarize", "brainstorm", "chat"],
+          "description": "The processing mode selected by the user."
+        },
+        "modelUsed": {
+          "type": "string",
+          "description": "The Gemini model used to generate the reflection."
+        },
+        "durationMs": {
+          "type": "number",
+          "description": "Generation duration in milliseconds."
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Unix timestamp in milliseconds when the interaction occurred."
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Brief title summarizing the journal entry."
+        },
+        "mood": {
+          "type": "object",
+          "description": "Selected emotional state (emoji, label, and valence) at time of journaling."
+        }
+      },
+      "required": ["userId", "prompt", "geminiResponse", "mode", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/interactions/{interactionId}": {
+      "schema": "Interaction",
+      "description": "Subcollection containing all private journal reflections and emotional mood trends isolated to the owner."
+    }
+  }
+}
